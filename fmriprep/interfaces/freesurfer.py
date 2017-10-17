@@ -30,8 +30,7 @@ from niworkflows.nipype.interfaces.base import (
     isdefined, InputMultiPath, BaseInterfaceInputSpec, TraitedSpec, File, traits, Directory
 )
 from niworkflows.nipype.interfaces import freesurfer as fs
-
-from niworkflows.interfaces.base import SimpleInterface
+from niworkflows.nipype.interfaces.base import SimpleInterface
 
 
 class StructuralReference(fs.RobustTemplate):
@@ -68,8 +67,14 @@ class MakeMidthicknessInputSpec(fs.utils.MRIsExpandInputSpec):
 
 
 class MakeMidthickness(fs.MRIsExpand):
-    """ Variation on RobustTemplate that simply copies the source if a single
-    volume is provided. """
+    """ Variation on MRIsExpand that checks for an existing midthickness/graymid
+    surface, and copies if available.
+
+    mris_expand is an expensive operation, so this avoids re-running it when the
+    working directory is lost.
+    If users provide their own midthickness/graymid file, we assume they have
+    created it correctly.
+    """
     input_spec = MakeMidthicknessInputSpec
 
     @property
