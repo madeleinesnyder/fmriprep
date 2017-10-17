@@ -36,19 +36,21 @@ import pkg_resources as pkgr
 from niworkflows.nipype import logging
 from niworkflows.nipype.utils.filemanip import split_filename
 from niworkflows.nipype.pipeline import engine as pe
-from niworkflows.nipype.interfaces import ants, afni, c3, fsl
-from niworkflows.nipype.interfaces import utility as niu
-from niworkflows.nipype.interfaces import freesurfer as fs
+from niworkflows.nipype.interfaces import afni, fsl, utility as niu, freesurfer as fs
 
 import niworkflows.data as nid
 from niworkflows.interfaces.registration import EstimateReferenceImage
+from niworkflows.interfaces.fixes import (FixHeaderApplyTransforms as ApplyTransforms,
+                                          FixHeaderRegistration as Registration)
+from niworkflows.interfaces.utils import GenerateSamplingReference
 from niworkflows.interfaces import SimpleBeforeAfter, NormalizeMotionParams
+
 
 from ..interfaces import (
     DerivativesDataSink, InvertT1w, ValidateImage, GiftiNameSource, GiftiSetAnatomicalStructure,
     MCFLIRT2ITK, MultiApplyTransforms
 )
-from ..interfaces.images import GenerateSamplingReference, extract_wm
+from ..interfaces.images import extract_wm
 from ..interfaces.nilearn import Merge
 from ..interfaces.reports import FunctionalSummary
 from ..workflows import confounds
@@ -63,7 +65,7 @@ LOGGER = logging.getLogger('workflow')
 
 
 def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
-                         bold2t1w_dof, reportlets_dir,
+                         use_bbr, bold2t1w_dof, reportlets_dir,
                          output_spaces, template, output_dir, omp_nthreads,
                          fmap_bspline, fmap_demean, use_syn, force_syn,
                          use_aroma, ignore_aroma_err, medial_surface_nan,
@@ -86,6 +88,7 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
                                   output_spaces=['T1w', 'fsnative',
                                                  'template', 'fsaverage5'],
                                   debug=False,
+                                  use_bbr=True,
                                   bold2t1w_dof=9,
                                   fmap_bspline=True,
                                   fmap_demean=True,
@@ -97,7 +100,7 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
                                   use_aroma=False,
                                   ignore_aroma_err=False)
 
-    Parameters
+    **Parameters**
 
         bold_file : str
             BOLD series NIfTI file
@@ -106,6 +109,9 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
         freesurfer : bool
             Enable FreeSurfer functional registration (bbregister) and resampling
             BOLD series to FreeSurfer surface meshes.
+        use_bbr : bool or None
+            Enable/disable boundary-based registration refinement.
+            If ``None``, test BBR result for distortion before accepting.
         bold2t1w_dof : 6, 9 or 12
             Degrees-of-freedom for BOLD-T1w registration
         reportlets_dir : str
@@ -150,7 +156,7 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
         layout : BIDSLayout
             BIDSLayout structure to enable metadata retrieval
 
-    Inputs
+    **Inputs**
 
         bold_file
             BOLD series NIfTI file
@@ -173,11 +179,13 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
             FreeSurfer SUBJECTS_DIR
         subject_id
             FreeSurfer subject ID
-        fs_2_t1_transform
-            Affine transform from FreeSurfer subject space to T1w space
+        t1_2_fsnative_forward_transform
+            LTA-style affine matrix translating from T1w to FreeSurfer-conformed subject space
+        t1_2_fsnative_reverse_transform
+            LTA-style affine matrix translating from FreeSurfer-conformed subject space to T1w
 
 
-    Outputs
+    **Outputs**
 
         bold_t1
             BOLD series, resampled to T1w space
@@ -195,6 +203,21 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
             Noise components identified by ICA-AROMA
         melodic_mix
             FSL MELODIC mixing matrix
+
+
+    **Subworkflows**
+
+        * :py:func:`~fmriprep.workflows.bold.init_bold_reference_wf`
+        * :py:func:`~fmriprep.workflows.bold.init_bold_stc_wf`
+        * :py:func:`~fmriprep.workflows.bold.init_bold_hmc_wf`
+        * :py:func:`~fmriprep.workflows.bold.init_bold_reg_wf`
+        * :py:func:`~fmriprep.workflows.bold.init_bold_confounds_wf`
+        * :py:func:`~fmriprep.workflows.fieldmap.unwarp.init_pepolar_unwarp_wf`
+        * :py:func:`~fmriprep.workflows.fieldmap.init_fmap_estimator_wf`
+        * :py:func:`~fmriprep.workflows.fieldmap.init_sdc_unwarp_wf`
+        * :py:func:`~fmriprep.workflows.bold.init_nonlinear_sdc_wf`
+        * :py:func:`~fmriprep.workflows.bold.init_bold_mni_trans_wf`
+        * :py:func:`~fmriprep.workflows.bold.init_bold_surf_wf`
 
     """
 
@@ -222,6 +245,7 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
             'magnitude2': 'sub-03/ses-2/fmap/sub-03_ses-2_run-1_magnitude2.nii.gz'
         }]
         run_stc = True
+        bold_pe = 'j'
     else:
         metadata = layout.get_metadata(bold_file)
         # Find fieldmaps. Options: (phase1|phase2|phasediff|epi|fieldmap)
@@ -232,20 +256,22 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
         run_stc = ("SliceTiming" in metadata and
                    'slicetiming' not in ignore and
                    (_get_series_len(bold_file) > 4 or "TooShort"))
+        bold_pe = metadata.get("PhaseEncodingDirection")
 
     # TODO: To be removed (supported fieldmaps):
     if not set([fmap['type'] for fmap in fmaps]).intersection(['phasediff', 'fieldmap', 'epi']):
         fmaps = None
 
     # Run SyN if forced or in the absence of fieldmap correction
-    use_syn = force_syn or (use_syn and not fmaps)
+    use_syn = not dismiss_t1w and (force_syn or (use_syn and not fmaps))
 
     # Build workflow
     workflow = pe.Workflow(name=name)
     inputnode = pe.Node(niu.IdentityInterface(
         fields=['bold_file', 't1_preproc', 't1_brain', 't1_mask', 't1_seg', 't1_tpms',
                 't1_2_mni_forward_transform', 't1_2_mni_reverse_transform',
-                'subjects_dir', 'subject_id', 'fs_2_t1_transform']),
+                'subjects_dir', 'subject_id', 't1_2_fsnative_forward_transform',
+                't1_2_fsnative_reverse_transform']),
         name='inputnode')
     inputnode.inputs.bold_file = bold_file
 
@@ -254,10 +280,13 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
                 'aroma_noise_ics', 'melodic_mix', 'nonaggr_denoised_file']),
         name='outputnode')
 
-    summary = pe.Node(FunctionalSummary(output_spaces=output_spaces), name='summary',
-                      mem_gb=0.05)
-    summary.inputs.slice_timing = run_stc
-    summary.inputs.registration = 'bbregister' if freesurfer else 'FLIRT'
+    summary = pe.Node(
+        FunctionalSummary(output_spaces=output_spaces,
+                          slice_timing=run_stc,
+                          registration='FreeSurfer' if freesurfer else 'FSL',
+                          registration_dof=bold2t1w_dof,
+                          pe_direction=bold_pe),
+        name='summary', mem_gb=DEFAULT_MEMORY_MIN_GB, run_without_submitting=True)
 
     func_reports_wf = init_func_reports_wf(reportlets_dir=reportlets_dir,
                                            freesurfer=freesurfer,
@@ -301,7 +330,7 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
     # mean BOLD registration to T1w
     bold_reg_wf = init_bold_reg_wf(name='bold_reg_wf',
                                    freesurfer=freesurfer,
-                                   dismiss_t1w=dismiss_t1w,
+                                   use_bbr=use_bbr,
                                    bold2t1w_dof=bold2t1w_dof,
                                    bold_file_size_gb=bold_file_size_gb,
                                    omp_nthreads=omp_nthreads,
@@ -317,112 +346,29 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
         name='bold_confounds_wf')
     bold_confounds_wf.get_node('inputnode').inputs.t1_transform_flags = [False]
 
-    
     # connect up the workflows that don't require T1 images
-    if dismiss_t1w:
+    workflow.connect([
+        (inputnode, bold_reference_wf, [('bold_file', 'inputnode.bold_file')]),
+        (bold_reference_wf, bold_hmc_wf, [
+            ('outputnode.raw_ref_image', 'inputnode.raw_ref_image')]),
+        (bold_reference_wf, func_reports_wf, [
+            ('outputnode.validation_report', 'inputnode.validation_report')]),
+        (summary, func_reports_wf, [('out_report', 'inputnode.summary_report')]),
+        ])
+
+    if not dismiss_t1w:
         workflow.connect([
-            (inputnode, bold_reference_wf, [('bold_file', 'inputnode.bold_file')]),
-            (bold_reference_wf, bold_hmc_wf, [('outputnode.raw_ref_image', 'inputnode.raw_ref_image')]),
-            (bold_reference_wf, func_reports_wf, [('outputnode.validation_report', 'inputnode.validation_report')])])
-            
-         # bool('TooShort') == True, so check True explicitly
-        if run_stc is True:
-            workflow.connect([(bold_reference_wf, bold_stc_wf, [('outputnode.bold_file', 'inputnode.bold_file'),
-                                               ('outputnode.skip_vols', 'inputnode.skip_vols')]),(bold_stc_wf, bold_hmc_wf, [('outputnode.stc_file', 'inputnode.bold_file')])])
-        else:
-            workflow.connect([
-                 (bold_reference_wf, bold_hmc_wf, [('outputnode.bold_file', 'inputnode.bold_file')])])
-        
-        nonlinear_sdc_wf = sdc_unwarp_wf = None
-         
-        if use_syn:
-            nonlinear_sdc_wf = init_nonlinear_sdc_wf(
-                bold_file=bold_file, layout=layout, freesurfer=freesurfer, bold2t1w_dof=bold2t1w_dof,
-                template=template, omp_nthreads=omp_nthreads)
-
-            workflow.connect([
-                (inputnode, nonlinear_sdc_wf, [
-                    ('t1_brain', 'inputnode.t1_brain'),
-                    ('t1_seg', 'inputnode.t1_seg'),
-                    ('t1_2_mni_reverse_transform', 'inputnode.t1_2_mni_reverse_transform'),
-                    ('subjects_dir', 'inputnode.subjects_dir'),
-                    ('subject_id', 'inputnode.subject_id')]),
-                (bold_reference_wf, nonlinear_sdc_wf, [
-                    ('outputnode.ref_image_brain', 'inputnode.bold_ref')]),
-                (nonlinear_sdc_wf, func_reports_wf, [
-                    ('outputnode.out_warp_report', 'inputnode.syn_sdc_report')]),
-            ])
-
-            # XXX Eliminate branch when forcing isn't an option
-            if not fmaps:
-                LOGGER.warn('No fieldmaps found or they were ignored. Using EXPERIMENTAL '
-                            'nonlinear susceptibility correction for dataset %s.', bold_file)
-                summary.inputs.distortion_correction = 'SyN'
-                workflow.connect([
-                    (nonlinear_sdc_wf, func_reports_wf, [
-                        ('outputnode.out_mask_report', 'inputnode.bold_mask_report')]),
-                    (nonlinear_sdc_wf, bold_reg_wf, [
-                        ('outputnode.out_warp', 'inputnode.fieldwarp'),
-                        ('outputnode.out_reference_brain', 'inputnode.ref_bold_brain'),
-                        ('outputnode.out_mask', 'inputnode.ref_bold_mask')]),
-                ])
-            
-            if 'template' in output_spaces:
-                # Apply transforms in 1 shot
-                # Only use uncompressed output if AROMA is to be run
-                bold_mni_trans_wf = init_bold_mni_trans_wf(
-                    template=template,
-                    bold_file_size_gb=bold_file_size_gb,
-                    omp_nthreads=omp_nthreads,
-                    output_grid_ref=output_grid_ref,
-                    use_compression=not (low_mem and use_aroma),
-                    use_fieldwarp=(fmaps is not None or use_syn),
-                    name='bold_mni_trans_wf'
-                )
-
-            workflow.connect([
-                (inputnode, bold_mni_trans_wf, [
-                    ('bold_file', 'inputnode.name_source'),
-                    ('t1_2_mni_forward_transform', 'inputnode.t1_2_mni_forward_transform')]),
-                (bold_hmc_wf, bold_mni_trans_wf, [
-                    ('outputnode.bold_split', 'inputnode.bold_split'),
-                    ('outputnode.xforms', 'inputnode.hmc_xforms')]),
-                (bold_mni_trans_wf, outputnode, [('outputnode.bold_mni', 'bold_mni'),
-                                                 ('outputnode.bold_mask_mni', 'bold_mask_mni')]),
-            ])
-
-            if fmaps:
-                workflow.connect([
-                    (sdc_unwarp_wf, bold_mni_trans_wf, [
-                        ('outputnode.out_warp', 'inputnode.fieldwarp'),
-                        ('outputnode.out_mask', 'inputnode.bold_mask')]),
-                ])
-   
-            elif use_syn:
-                workflow.connect([
-                    (nonlinear_sdc_wf, bold_mni_trans_wf, [
-                        ('outputnode.out_warp', 'inputnode.fieldwarp'),
-                        ('outputnode.out_mask', 'inputnode.bold_mask')]),
-                ])
-
-        return workflow
- 
-    
-    # connect up the rest
-    else:
-        workflow.connect([
-            (inputnode, bold_reference_wf, [('bold_file', 'inputnode.bold_file')]),
-            (bold_reference_wf, bold_hmc_wf, [('outputnode.raw_ref_image', 'inputnode.raw_ref_image')]),
-            (inputnode, bold_reg_wf, [('bold_file', 'inputnode.name_source'),
-                                      ('t1_preproc', 'inputnode.t1_preproc'),
-                                      ('t1_brain', 'inputnode.t1_brain'),
-                                      ('t1_mask', 'inputnode.t1_mask'),
-                                      ('t1_seg', 'inputnode.t1_seg'),
-                                      # Undefined if --no-freesurfer, but this is safe
-                                      ('subjects_dir', 'inputnode.subjects_dir'),
-                                      ('subject_id', 'inputnode.subject_id'),
-                                      ('fs_2_t1_transform', 'inputnode.fs_2_t1_transform')
-                                      ]),
+            (inputnode, bold_reg_wf, [
+                ('bold_file', 'inputnode.name_source'),
+                ('t1_preproc', 'inputnode.t1_preproc'),
+                ('t1_brain', 'inputnode.t1_brain'),
+                ('t1_mask', 'inputnode.t1_mask'),
+                ('t1_seg', 'inputnode.t1_seg'),
+                # Undefined if --no-freesurfer, but this is safe
+                ('subjects_dir', 'inputnode.subjects_dir'),
+                ('subject_id', 'inputnode.subject_id'),
+                ('t1_2_fsnative_reverse_transform', 'inputnode.t1_2_fsnative_reverse_transform')
+                ]),
             (inputnode, bold_confounds_wf, [('t1_tpms', 'inputnode.t1_tpms'),
                                             ('t1_mask', 'inputnode.t1_mask')]),
             (bold_hmc_wf, bold_reg_wf, [('outputnode.bold_split', 'inputnode.bold_split'),
@@ -431,10 +377,9 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
             (bold_reg_wf, bold_confounds_wf, [
                 ('outputnode.bold_t1', 'inputnode.bold_t1'),
                 ('outputnode.bold_mask_t1', 'inputnode.bold_mask_t1')]),
-            (bold_reference_wf, func_reports_wf, [
-                ('outputnode.validation_report', 'inputnode.validation_report')]),
             (bold_reg_wf, func_reports_wf, [
                 ('outputnode.out_report', 'inputnode.bold_reg_report'),
+                ('outputnode.fallback', 'inputnode.bold_reg_fallback'),
             ]),
             (bold_confounds_wf, outputnode, [
                 ('outputnode.confounds_file', 'confounds'),
@@ -449,18 +394,21 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
                 ('outputnode.tcompcor_report', 'inputnode.tcompcor_report'),
                 ('outputnode.ica_aroma_report', 'inputnode.ica_aroma_report')]),
             (bold_confounds_wf, summary, [('outputnode.confounds_list', 'confounds')]),
-            (summary, func_reports_wf, [('out_report', 'inputnode.summary_report')]),
+            (bold_reg_wf, summary, [('outputnode.fallback', 'fallback')]),
         ])
+    else:
+        summary.inputs.confounds = []
+        summary.inputs.fallback = False
 
-        # bool('TooShort') == True, so check True explicitly
-        if run_stc is True:
-            workflow.connect([
-                (bold_reference_wf, bold_stc_wf, [('outputnode.bold_file', 'inputnode.bold_file'),
-                                                  ('outputnode.skip_vols', 'inputnode.skip_vols')]),
-                (bold_stc_wf, bold_hmc_wf, [('outputnode.stc_file', 'inputnode.bold_file')])])
-        else:
-            workflow.connect([
-                (bold_reference_wf, bold_hmc_wf, [('outputnode.bold_file', 'inputnode.bold_file')])])
+    # bool('TooShort') == True, so check True explicitly
+    if run_stc is True:
+        workflow.connect([
+            (bold_reference_wf, bold_stc_wf, [('outputnode.bold_file', 'inputnode.bold_file'),
+                                              ('outputnode.skip_vols', 'inputnode.skip_vols')]),
+            (bold_stc_wf, bold_hmc_wf, [('outputnode.stc_file', 'inputnode.bold_file')])])
+    else:
+        workflow.connect([
+            (bold_reference_wf, bold_hmc_wf, [('outputnode.bold_file', 'inputnode.bold_file')])])
 
     # Cases:
     # fmaps | use_syn | force_syn  |  ACTION
@@ -473,100 +421,182 @@ def init_func_preproc_wf(bold_file, ignore, dismiss_t1w, freesurfer,
 
     # Predefine to pacify the lintian checks about
     # "could be used before defined" - logic was tested to be sound
-        nonlinear_sdc_wf = sdc_unwarp_wf = None
+    nonlinear_sdc_wf = sdc_unwarp_wf = None
 
-        if use_syn:
-            nonlinear_sdc_wf = init_nonlinear_sdc_wf(
-                bold_file=bold_file, layout=layout, freesurfer=freesurfer, bold2t1w_dof=bold2t1w_dof,
-                template=template, omp_nthreads=omp_nthreads)
+    if fmaps:
+        # In case there are multiple fieldmaps prefer EPI
+        fmaps.sort(key=lambda fmap: {'epi': 0, 'fieldmap': 1, 'phasediff': 2}[fmap['type']])
+        fmap = fmaps[0]
 
+        LOGGER.info('Fieldmap estimation: type "%s" found', fmap['type'])
+        summary.inputs.distortion_correction = fmap['type']
+
+        if fmap['type'] == 'epi':
+            epi_fmaps = [fmap_['epi'] for fmap_ in fmaps if fmap_['type'] == 'epi']
+            sdc_unwarp_wf = init_pepolar_unwarp_wf(fmaps=epi_fmaps,
+                                                   layout=layout,
+                                                   bold_file=bold_file,
+                                                   omp_nthreads=omp_nthreads,
+                                                   name='pepolar_unwarp_wf')
+        else:
+            # Import specific workflows here, so we don't brake everything with one
+            # unused workflow.
+            from .fieldmap import init_fmap_estimator_wf, init_sdc_unwarp_wf
+            fmap_estimator_wf = init_fmap_estimator_wf(fmap_bids=fmap,
+                                                       reportlets_dir=reportlets_dir,
+                                                       omp_nthreads=omp_nthreads,
+                                                       fmap_bspline=fmap_bspline)
+            sdc_unwarp_wf = init_sdc_unwarp_wf(reportlets_dir=reportlets_dir,
+                                               omp_nthreads=omp_nthreads,
+                                               fmap_bspline=fmap_bspline,
+                                               fmap_demean=fmap_demean,
+                                               debug=debug,
+                                               name='sdc_unwarp_wf')
             workflow.connect([
-                (inputnode, nonlinear_sdc_wf, [
-                    ('t1_brain', 'inputnode.t1_brain'),
-                    ('t1_seg', 'inputnode.t1_seg'),
-                    ('t1_2_mni_reverse_transform', 'inputnode.t1_2_mni_reverse_transform'),
-                    ('subjects_dir', 'inputnode.subjects_dir'),
-                    ('subject_id', 'inputnode.subject_id')]),
-                (bold_reference_wf, nonlinear_sdc_wf, [
-                    ('outputnode.ref_image_brain', 'inputnode.bold_ref')]),
+                (fmap_estimator_wf, sdc_unwarp_wf, [
+                    ('outputnode.fmap', 'inputnode.fmap'),
+                    ('outputnode.fmap_ref', 'inputnode.fmap_ref'),
+                    ('outputnode.fmap_mask', 'inputnode.fmap_mask')]),
+            ])
+
+        # Connections and workflows common for all types of fieldmaps
+        workflow.connect([
+            (inputnode, sdc_unwarp_wf, [('bold_file', 'inputnode.name_source')]),
+            (bold_reference_wf, sdc_unwarp_wf, [
+                ('outputnode.ref_image', 'inputnode.in_reference'),
+                ('outputnode.ref_image_brain', 'inputnode.in_reference_brain'),
+                ('outputnode.bold_mask', 'inputnode.in_mask')]),
+            (sdc_unwarp_wf, func_reports_wf, [
+                ('outputnode.out_mask_report', 'inputnode.bold_mask_report')])
+        ])
+
+        # Report on BOLD correction
+        fmap_unwarp_report_wf = init_fmap_unwarp_report_wf(reportlets_dir=reportlets_dir,
+                                                           name='fmap_unwarp_report_wf')
+        if not dismiss_t1w:
+            workflow.connect([
+                (sdc_unwarp_wf, bold_reg_wf, [
+                    ('outputnode.out_warp', 'inputnode.fieldwarp'),
+                    ('outputnode.out_reference_brain', 'inputnode.ref_bold_brain'),
+                    ('outputnode.out_mask', 'inputnode.ref_bold_mask')]),
+                (inputnode, fmap_unwarp_report_wf, [
+                    ('t1_seg', 'inputnode.in_seg'),
+                    ('bold_file', 'inputnode.name_source')]),
+                (bold_reference_wf, fmap_unwarp_report_wf, [
+                    ('outputnode.ref_image', 'inputnode.in_pre')]),
+                (sdc_unwarp_wf, fmap_unwarp_report_wf, [
+                    ('outputnode.out_reference', 'inputnode.in_post')]),
+                (bold_reg_wf, fmap_unwarp_report_wf, [
+                    ('outputnode.itk_t1_to_bold', 'inputnode.in_xfm')]),
+            ])
+    elif not use_syn:
+        LOGGER.warn('No fieldmaps found or they were ignored, building base workflow '
+                    'for dataset %s.', bold_file)
+        summary.inputs.distortion_correction = 'None'
+        workflow.connect([
+            (bold_reference_wf, func_reports_wf, [
+                ('outputnode.bold_mask_report', 'inputnode.bold_mask_report')]),
+        ])
+        if not dismiss_t1w:
+            workflow.connect([
+                (bold_reference_wf, bold_reg_wf, [
+                    ('outputnode.ref_image_brain', 'inputnode.ref_bold_brain'),
+                    ('outputnode.bold_mask', 'inputnode.ref_bold_mask')]),
+                ])
+
+    if use_syn:
+        nonlinear_sdc_wf = init_nonlinear_sdc_wf(
+            bold_file=bold_file, bold_pe=bold_pe, freesurfer=freesurfer, bold2t1w_dof=bold2t1w_dof,
+            template=template, omp_nthreads=omp_nthreads)
+
+        workflow.connect([
+            (inputnode, nonlinear_sdc_wf, [
+                ('t1_brain', 'inputnode.t1_brain'),
+                ('t1_seg', 'inputnode.t1_seg'),
+                ('t1_2_mni_reverse_transform', 'inputnode.t1_2_mni_reverse_transform')]),
+            (bold_reference_wf, nonlinear_sdc_wf, [
+                ('outputnode.ref_image_brain', 'inputnode.bold_ref')]),
+            (nonlinear_sdc_wf, func_reports_wf, [
+                ('outputnode.out_warp_report', 'inputnode.syn_sdc_report')]),
+        ])
+
+        # XXX Eliminate branch when forcing isn't an option
+        if not fmaps:
+            LOGGER.warn('No fieldmaps found or they were ignored. Using EXPERIMENTAL '
+                        'nonlinear susceptibility correction for dataset %s.', bold_file)
+            summary.inputs.distortion_correction = 'SyN'
+            workflow.connect([
                 (nonlinear_sdc_wf, func_reports_wf, [
-                    ('outputnode.out_warp_report', 'inputnode.syn_sdc_report')]),
+                    ('outputnode.out_mask_report', 'inputnode.bold_mask_report')]),
+                (nonlinear_sdc_wf, bold_reg_wf, [
+                    ('outputnode.out_warp', 'inputnode.fieldwarp'),
+                    ('outputnode.out_reference_brain', 'inputnode.ref_bold_brain'),
+                    ('outputnode.out_mask', 'inputnode.ref_bold_mask')]),
             ])
 
-            # XXX Eliminate branch when forcing isn't an option
-            if not fmaps:
-                LOGGER.warn('No fieldmaps found or they were ignored. Using EXPERIMENTAL '
-                            'nonlinear susceptibility correction for dataset %s.', bold_file)
-                summary.inputs.distortion_correction = 'SyN'
-                workflow.connect([
-                    (nonlinear_sdc_wf, func_reports_wf, [
-                        ('outputnode.out_mask_report', 'inputnode.bold_mask_report')]),
-                    (nonlinear_sdc_wf, bold_reg_wf, [
-                        ('outputnode.out_warp', 'inputnode.fieldwarp'),
-                        ('outputnode.out_reference_brain', 'inputnode.ref_bold_brain'),
-                        ('outputnode.out_mask', 'inputnode.ref_bold_mask')]),
-                ])
+    if not dismiss_t1w and 'template' in output_spaces:
+        # Apply transforms in 1 shot
+        # Only use uncompressed output if AROMA is to be run
+        bold_mni_trans_wf = init_bold_mni_trans_wf(
+            template=template,
+            bold_file_size_gb=bold_file_size_gb,
+            omp_nthreads=omp_nthreads,
+            output_grid_ref=output_grid_ref,
+            use_compression=not (low_mem and use_aroma),
+            use_fieldwarp=(fmaps is not None or use_syn),
+            name='bold_mni_trans_wf'
+        )
 
-        if 'template' in output_spaces:
-            # Apply transforms in 1 shot
-            # Only use uncompressed output if AROMA is to be run
-            bold_mni_trans_wf = init_bold_mni_trans_wf(
-                template=template,
-                bold_file_size_gb=bold_file_size_gb,
-                omp_nthreads=omp_nthreads,
-                output_grid_ref=output_grid_ref,
-                use_compression=not (low_mem and use_aroma),
-                use_fieldwarp=(fmaps is not None or use_syn),
-                name='bold_mni_trans_wf'
-            )
+        workflow.connect([
+            (inputnode, bold_mni_trans_wf, [
+                ('bold_file', 'inputnode.name_source'),
+                ('t1_2_mni_forward_transform', 'inputnode.t1_2_mni_forward_transform')]),
+            (bold_hmc_wf, bold_mni_trans_wf, [
+                ('outputnode.bold_split', 'inputnode.bold_split'),
+                ('outputnode.xforms', 'inputnode.hmc_xforms')]),
+            (bold_reg_wf, bold_mni_trans_wf, [
+                ('outputnode.itk_bold_to_t1', 'inputnode.itk_bold_to_t1')]),
+            (bold_mni_trans_wf, outputnode, [('outputnode.bold_mni', 'bold_mni'),
+                                             ('outputnode.bold_mask_mni', 'bold_mask_mni')]),
+            (bold_mni_trans_wf, bold_confounds_wf, [
+                ('outputnode.bold_mask_mni', 'inputnode.bold_mask_mni'),
+                ('outputnode.bold_mni', 'inputnode.bold_mni')])
+        ])
 
+        if fmaps:
             workflow.connect([
-                (inputnode, bold_mni_trans_wf, [
-                    ('bold_file', 'inputnode.name_source'),
-                    ('t1_2_mni_forward_transform', 'inputnode.t1_2_mni_forward_transform')]),
-                (bold_hmc_wf, bold_mni_trans_wf, [
-                    ('outputnode.bold_split', 'inputnode.bold_split'),
-                    ('outputnode.xforms', 'inputnode.hmc_xforms')]),
-                (bold_reg_wf, bold_mni_trans_wf, [
-                    ('outputnode.itk_bold_to_t1', 'inputnode.itk_bold_to_t1')]),
-                (bold_mni_trans_wf, outputnode, [('outputnode.bold_mni', 'bold_mni'),
-                                                 ('outputnode.bold_mask_mni', 'bold_mask_mni')]),
-                (bold_mni_trans_wf, bold_confounds_wf, [
-                    ('outputnode.bold_mask_mni', 'inputnode.bold_mask_mni'),
-                    ('outputnode.bold_mni', 'inputnode.bold_mni')])
+                (sdc_unwarp_wf, bold_mni_trans_wf, [
+                    ('outputnode.out_warp', 'inputnode.fieldwarp'),
+                    ('outputnode.out_mask', 'inputnode.bold_mask')]),
             ])
-
-            if fmaps:
-                workflow.connect([
-                    (sdc_unwarp_wf, bold_mni_trans_wf, [
-                        ('outputnode.out_warp', 'inputnode.fieldwarp'),
-                        ('outputnode.out_mask', 'inputnode.bold_mask')]),
-                ])
-            elif use_syn:
-                workflow.connect([
-                    (nonlinear_sdc_wf, bold_mni_trans_wf, [
-                        ('outputnode.out_warp', 'inputnode.fieldwarp'),
+        elif use_syn:
+            workflow.connect([
+                (nonlinear_sdc_wf, bold_mni_trans_wf, [
+                    ('outputnode.out_warp', 'inputnode.fieldwarp'),
                     ('outputnode.out_mask', 'inputnode.bold_mask')]),
             ])
         else:
             workflow.connect([
                 (bold_reference_wf, bold_mni_trans_wf, [
                     ('outputnode.bold_mask', 'inputnode.bold_mask')]),
-                ])
-
-        if freesurfer and any(space.startswith('fs') for space in output_spaces):
-            LOGGER.info('Creating BOLD surface-sampling workflow.')
-            bold_surf_wf = init_bold_surf_wf(output_spaces=output_spaces,
-                                             medial_surface_nan=medial_surface_nan,
-                                             name='bold_surf_wf')
-            workflow.connect([
-                (inputnode, bold_surf_wf, [('subjects_dir', 'inputnode.subjects_dir'),
-                                           ('subject_id', 'inputnode.subject_id')]),
-                (bold_reg_wf, bold_surf_wf, [('outputnode.bold_t1', 'inputnode.source_file')]),
-                (bold_surf_wf, outputnode, [('outputnode.surfaces', 'surfaces')]),
             ])
 
-        return workflow
+    if not dismiss_t1w and freesurfer and any(space.startswith('fs') for space in output_spaces):
+        LOGGER.info('Creating BOLD surface-sampling workflow.')
+        bold_surf_wf = init_bold_surf_wf(output_spaces=output_spaces,
+                                         medial_surface_nan=medial_surface_nan,
+                                         name='bold_surf_wf')
+        workflow.connect([
+            (inputnode, bold_surf_wf, [
+                ('t1_preproc', 'inputnode.t1_preproc'),
+                ('subjects_dir', 'inputnode.subjects_dir'),
+                ('subject_id', 'inputnode.subject_id'),
+                ('t1_2_fsnative_forward_transform', 'inputnode.t1_2_fsnative_forward_transform')]),
+            (bold_reg_wf, bold_surf_wf, [('outputnode.bold_t1', 'inputnode.source_file')]),
+            (bold_surf_wf, outputnode, [('outputnode.surfaces', 'surfaces')]),
+        ])
+
+    return workflow
 
 
 def init_bold_reference_wf(omp_nthreads, bold_file=None, name='bold_reference_wf'):
@@ -584,7 +614,7 @@ def init_bold_reference_wf(omp_nthreads, bold_file=None, name='bold_reference_wf
         from fmriprep.workflows.bold import init_bold_reference_wf
         wf = init_bold_reference_wf(omp_nthreads=1)
 
-    Parameters
+    **Parameters**
 
         bold_file : str
             BOLD series NIfTI file
@@ -593,12 +623,12 @@ def init_bold_reference_wf(omp_nthreads, bold_file=None, name='bold_reference_wf
         name : str
             Name of workflow (default: ``bold_reference_wf``)
 
-    Inputs
+    **Inputs**
 
         bold_file
             BOLD series NIfTI file
 
-    Outputs
+    **Outputs**
 
         bold_file
             Validated BOLD series NIfTI file
@@ -616,6 +646,11 @@ def init_bold_reference_wf(omp_nthreads, bold_file=None, name='bold_reference_wf
             Reportlet showing quality of masking
         validation_report
             HTML reportlet indicating whether ``bold_file`` had a valid affine
+
+
+    **Subworkflows**
+
+        * :py:func:`~fmriprep.workflows.util.init_enhance_and_skullstrip_wf`
 
     """
     workflow = pe.Workflow(name=name)
@@ -671,21 +706,21 @@ def init_bold_stc_wf(metadata, name='bold_stc_wf'):
                       "SliceTiming": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]},
             )
 
-    Parameters
+    **Parameters**
 
         metadata : dict
             BIDS metadata for BOLD file
         name : str
             Name of workflow (default: ``bold_stc_wf``)
 
-    Inputs
+    **Inputs**
 
         bold_file
             BOLD series NIfTI file
         skip_vols
             Number of non-steady-state volumes detected at beginning of ``bold_file``
 
-    Outputs
+    **Outputs**
 
         stc_file
             Slice-timing corrected BOLD series NIfTI file
@@ -745,7 +780,7 @@ def init_bold_hmc_wf(bold_file_size_gb, omp_nthreads, name='bold_hmc_wf'):
         from fmriprep.workflows.bold import init_bold_hmc_wf
         wf = init_bold_hmc_wf(bold_file_size_gb=3, omp_nthreads=1)
 
-    Parameters
+    **Parameters**
 
         bold_file_size_gb : float
             Size of BOLD file in GB
@@ -754,14 +789,14 @@ def init_bold_hmc_wf(bold_file_size_gb, omp_nthreads, name='bold_hmc_wf'):
         name : str
             Name of workflow (default: ``bold_hmc_wf``)
 
-    Inputs
+    **Inputs**
 
         bold_file
             BOLD series NIfTI file
         raw_ref_image
             Reference image to which BOLD series is motion corrected
 
-    Outputs
+    **Outputs**
 
         bold_split
             Individual 3D volumes, not motion corrected
@@ -782,7 +817,7 @@ def init_bold_hmc_wf(bold_file_size_gb, omp_nthreads, name='bold_hmc_wf'):
     mcflirt = pe.Node(fsl.MCFLIRT(save_mats=True, save_plots=True),
                       name='mcflirt', mem_gb=bold_file_size_gb * 3)
 
-    fsl2itk = pe.Node(MCFLIRT2ITK(nprocs=omp_nthreads), name='fsl2itk',
+    fsl2itk = pe.Node(MCFLIRT2ITK(num_threads=omp_nthreads), name='fsl2itk',
                       mem_gb=0.05, n_procs=omp_nthreads)
 
     normalize_motion = pe.Node(NormalizeMotionParams(format='FSL'),
@@ -808,7 +843,7 @@ def init_bold_hmc_wf(bold_file_size_gb, omp_nthreads, name='bold_hmc_wf'):
     return workflow
 
 
-def init_bold_reg_wf(freesurfer, dismiss_t1w, bold2t1w_dof, bold_file_size_gb, omp_nthreads,
+def init_bold_reg_wf(freesurfer, use_bbr, bold2t1w_dof, bold_file_size_gb, omp_nthreads,
                      name='bold_reg_wf', use_compression=True,
                      use_fieldwarp=False):
     """
@@ -829,12 +864,16 @@ def init_bold_reg_wf(freesurfer, dismiss_t1w, bold2t1w_dof, bold_file_size_gb, o
         wf = init_bold_reg_wf(freesurfer=True,
                               bold_file_size_gb=3,
                               omp_nthreads=1,
+                              use_bbr=True,
                               bold2t1w_dof=9)
 
-    Parameters
+    **Parameters**
 
         freesurfer : bool
             Enable FreeSurfer functional registration (bbregister)
+        use_bbr : bool or None
+            Enable/disable boundary-based registration refinement.
+            If ``None``, test BBR result for distortion before accepting.
         bold2t1w_dof : 6, 9 or 12
             Degrees-of-freedom for BOLD-T1w registration
         bold_file_size_gb : float
@@ -848,7 +887,7 @@ def init_bold_reg_wf(freesurfer, dismiss_t1w, bold2t1w_dof, bold_file_size_gb, o
         use_fieldwarp : bool
             Include SDC warp in single-shot transform from BOLD to T1
 
-    Inputs
+    **Inputs**
 
         name_source
             BOLD series NIfTI file
@@ -875,17 +914,13 @@ def init_bold_reg_wf(freesurfer, dismiss_t1w, bold2t1w_dof, bold_file_size_gb, o
             FreeSurfer SUBJECTS_DIR
         subject_id
             FreeSurfer subject ID
-        fs_2_t1_transform
-            Affine transform from FreeSurfer subject space to T1w space
+        t1_2_fsnative_reverse_transform
+            LTA-style affine matrix translating from FreeSurfer-conformed subject space to T1w
         fieldwarp
             a :abbr:`DFM (displacements field map)` in ITK format
 
-    Outputs
+    **Outputs**
 
-        mat_bold_to_t1
-            Affine transform from ``ref_bold_brain`` to T1 space (FSL format)
-        mat_t1_to_bold
-            Affine transform from T1 space to BOLD space (FSL format)
         itk_bold_to_t1
             Affine transform from ``ref_bold_brain`` to T1 space (ITK format)
         itk_t1_to_bold
@@ -894,73 +929,59 @@ def init_bold_reg_wf(freesurfer, dismiss_t1w, bold2t1w_dof, bold_file_size_gb, o
             Motion-corrected BOLD series in T1 space
         bold_mask_t1
             BOLD mask in T1 space
-        fs_reg_file
-            Affine transform from ``ref_bold_brain`` to T1 space (FreeSurfer ``reg`` format)
         out_report
             Reportlet visualizing quality of registration
+        fallback
+            Boolean indicating whether BBR was rejected (mri_coreg registration returned)
+
+
+    **Subworkflows**
+
+        * :py:func:`~fmriprep.workflows.util.init_bbreg_wf`
+        * :py:func:`~fmriprep.workflows.util.init_fsl_bbr_wf`
 
     """
     workflow = pe.Workflow(name=name)
     inputnode = pe.Node(
-        niu.IdentityInterface(fields=['name_source', 'ref_bold_brain', 'ref_bold_mask',
-                                      't1_preproc', 't1_brain', 't1_mask',
-                                      't1_seg', 'bold_split', 'hmc_xforms',
-                                      'subjects_dir', 'subject_id', 'fs_2_t1_transform',
-                                      'fieldwarp']),
+        niu.IdentityInterface(
+            fields=['name_source', 'ref_bold_brain', 'ref_bold_mask',
+                    't1_preproc', 't1_brain', 't1_mask',
+                    't1_seg', 'bold_split', 'hmc_xforms',
+                    'subjects_dir', 'subject_id', 't1_2_fsnative_reverse_transform', 'fieldwarp']),
         name='inputnode'
     )
     outputnode = pe.Node(
-        niu.IdentityInterface(fields=['mat_bold_to_t1', 'mat_t1_to_bold',
-                                      'itk_bold_to_t1', 'itk_t1_to_bold',
-                                      'bold_t1', 'bold_mask_t1', 'fs_reg_file',
-                                      'out_report']),
+        niu.IdentityInterface(fields=['itk_bold_to_t1', 'itk_t1_to_bold',
+                                      'bold_t1', 'bold_mask_t1',
+                                      'out_report', 'fallback']),
         name='outputnode'
     )
 
     if freesurfer:
-        bbr_wf = init_bbreg_wf(bold2t1w_dof, report=True)
+        bbr_wf = init_bbreg_wf(use_bbr=use_bbr, bold2t1w_dof=bold2t1w_dof,
+                               omp_nthreads=omp_nthreads)
     else:
-        bbr_wf = init_fsl_bbr_wf(bold2t1w_dof, report=True)
-
-    # make equivalent warp fields
-    invt_bbr = pe.Node(fsl.ConvertXFM(invert_xfm=True), name='invt_bbr',
-                       mem_gb=DEFAULT_MEMORY_MIN_GB)
-
-    #  BOLD to T1 transform matrix is from fsl, using c3 tools to convert to
-    #  something ANTs will like.
-    fsl2itk_fwd = pe.Node(c3.C3dAffineTool(fsl2ras=True, itk_transform=True),
-                          name='fsl2itk_fwd', mem_gb=DEFAULT_MEMORY_MIN_GB)
-    fsl2itk_inv = pe.Node(c3.C3dAffineTool(fsl2ras=True, itk_transform=True),
-                          name='fsl2itk_inv', mem_gb=DEFAULT_MEMORY_MIN_GB)
+        bbr_wf = init_fsl_bbr_wf(use_bbr=use_bbr, bold2t1w_dof=bold2t1w_dof)
 
     workflow.connect([
-        (inputnode, bbr_wf, [('ref_bold_brain', 'inputnode.in_file'),
-                             ('fs_2_t1_transform', 'inputnode.fs_2_t1_transform'),
-                             ('subjects_dir', 'inputnode.subjects_dir'),
-                             ('subject_id', 'inputnode.subject_id'),
-                             ('t1_seg', 'inputnode.t1_seg'),
-                             ('t1_brain', 'inputnode.t1_brain')]),
-        (inputnode, fsl2itk_fwd, [('t1_preproc', 'reference_file'),
-                                  ('ref_bold_brain', 'source_file')]),
-        (inputnode, fsl2itk_inv, [('ref_bold_brain', 'reference_file'),
-                                  ('t1_preproc', 'source_file')]),
-        (bbr_wf, invt_bbr, [('outputnode.out_matrix_file', 'in_file')]),
-        (bbr_wf, fsl2itk_fwd, [('outputnode.out_matrix_file', 'transform_file')]),
-        (invt_bbr, fsl2itk_inv, [('out_file', 'transform_file')]),
-        (bbr_wf, outputnode, [('outputnode.out_matrix_file', 'mat_bold_to_t1'),
-                              ('outputnode.out_reg_file', 'fs_reg_file'),
-                              ('outputnode.out_report', 'out_report')]),
-        (invt_bbr, outputnode, [('out_file', 'mat_t1_to_bold')]),
-        (fsl2itk_fwd, outputnode, [('itk_transform', 'itk_bold_to_t1')]),
-        (fsl2itk_inv, outputnode, [('itk_transform', 'itk_t1_to_bold')]),
+        (inputnode, bbr_wf, [
+            ('ref_bold_brain', 'inputnode.in_file'),
+            ('t1_2_fsnative_reverse_transform', 'inputnode.t1_2_fsnative_reverse_transform'),
+            ('subjects_dir', 'inputnode.subjects_dir'),
+            ('subject_id', 'inputnode.subject_id'),
+            ('t1_seg', 'inputnode.t1_seg'),
+            ('t1_brain', 'inputnode.t1_brain')]),
+        (bbr_wf, outputnode, [('outputnode.itk_bold_to_t1', 'itk_bold_to_t1'),
+                              ('outputnode.itk_t1_to_bold', 'itk_t1_to_bold'),
+                              ('outputnode.out_report', 'out_report'),
+                              ('outputnode.fallback', 'fallback')]),
     ])
 
     gen_ref = pe.Node(GenerateSamplingReference(), name='gen_ref',
                       mem_gb=0.3)  # 256x256x256 * 64 / 8 ~ 150MB
 
     mask_t1w_tfm = pe.Node(
-        ants.ApplyTransforms(interpolation='NearestNeighbor',
-                             float=True),
+        ApplyTransforms(interpolation='NearestNeighbor', float=True),
         name='mask_t1w_tfm', mem_gb=0.1
     )
 
@@ -968,7 +989,7 @@ def init_bold_reg_wf(freesurfer, dismiss_t1w, bold2t1w_dof, bold_file_size_gb, o
         (inputnode, gen_ref, [('ref_bold_brain', 'moving_image'),
                               ('t1_brain', 'fixed_image')]),
         (gen_ref, mask_t1w_tfm, [('out_file', 'reference_image')]),
-        (fsl2itk_fwd, mask_t1w_tfm, [('itk_transform', 'transforms')]),
+        (bbr_wf, mask_t1w_tfm, [('outputnode.itk_bold_to_t1', 'transforms')]),
         (inputnode, mask_t1w_tfm, [('ref_bold_mask', 'input_image')]),
         (mask_t1w_tfm, outputnode, [('output_image', 'bold_mask_t1')])
     ])
@@ -987,13 +1008,13 @@ def init_bold_reg_wf(freesurfer, dismiss_t1w, bold2t1w_dof, bold_file_size_gb, o
         ])
 
     bold_to_t1w_transform = pe.Node(MultiApplyTransforms(
-        interpolation="LanczosWindowedSinc", float=True, nprocs=omp_nthreads),
+        interpolation="LanczosWindowedSinc", float=True, num_threads=omp_nthreads),
         name='bold_to_t1w_transform', mem_gb=0.1, n_procs=omp_nthreads)
     # bold_to_t1w_transform.terminal_output = 'file'  # OE: why this?
     merge = pe.Node(Merge(compress=use_compression), name='merge', mem_gb=bold_file_size_gb * 3)
 
     workflow.connect([
-        (fsl2itk_fwd, merge_xforms, [('itk_transform', 'in1')]),
+        (bbr_wf, merge_xforms, [('outputnode.itk_bold_to_t1', 'in1')]),
         (merge_xforms, bold_to_t1w_transform, [('out', 'transforms')]),
         (inputnode, merge, [('name_source', 'header_source')]),
         (merge, outputnode, [('out_file', 'bold_t1')]),
@@ -1023,7 +1044,7 @@ def init_bold_surf_wf(output_spaces, medial_surface_nan, name='bold_surf_wf'):
                                              'template', 'fsaverage5'],
                                medial_surface_nan=False)
 
-    Parameters
+    **Parameters**
 
         output_spaces : list
             List of output spaces functional images are to be resampled to
@@ -1034,16 +1055,20 @@ def init_bold_surf_wf(output_spaces, medial_surface_nan, name='bold_surf_wf'):
         medial_surface_nan : bool
             Replace medial wall values with NaNs on functional GIFTI files
 
-    Inputs
+    **Inputs**
 
         source_file
             Motion-corrected BOLD series in T1 space
+        t1_preproc
+            Bias-corrected structural template image
         subjects_dir
             FreeSurfer SUBJECTS_DIR
         subject_id
             FreeSurfer subject ID
+        t1_2_fsnative_forward_transform
+            LTA-style affine matrix translating from T1w to FreeSurfer-conformed subject space
 
-    Outputs
+    **Outputs**
 
         surfaces
             BOLD series, resampled to FreeSurfer surfaces
@@ -1051,7 +1076,8 @@ def init_bold_surf_wf(output_spaces, medial_surface_nan, name='bold_surf_wf'):
     """
     workflow = pe.Workflow(name=name)
     inputnode = pe.Node(
-        niu.IdentityInterface(fields=['source_file', 'subject_id', 'subjects_dir']),
+        niu.IdentityInterface(fields=['source_file', 't1_preproc', 'subject_id', 'subjects_dir',
+                                      't1_2_fsnative_forward_transform']),
         name='inputnode')
 
     outputnode = pe.Node(niu.IdentityInterface(fields=['surfaces']), name='outputnode')
@@ -1073,11 +1099,14 @@ def init_bold_surf_wf(output_spaces, medial_surface_nan, name='bold_surf_wf'):
                             mem_gb=DEFAULT_MEMORY_MIN_GB)
     rename_src.inputs.subject = spaces
 
+    resampling_xfm = pe.Node(fs.utils.LTAConvert(in_lta='identity.nofile', out_lta=True),
+                             name='resampling_xfm')
+    set_xfm_source = pe.Node(fs.ConcatenateLTA(out_type='RAS2RAS'), name='set_xfm_source')
+
     sampler = pe.MapNode(
         fs.SampleToSurface(sampling_method='average', sampling_range=(0, 1, 0.2),
-                           sampling_units='frac', reg_header=True,
-                           interp_method='trilinear', cortex_mask=True,
-                           out_type='gii'),
+                           sampling_units='frac', interp_method='trilinear', cortex_mask=True,
+                           override_reg_subj=True, out_type='gii'),
         iterfield=['source_file', 'target_subject'],
         iterables=('hemi', ['lh', 'rh']),
         name='sampler')
@@ -1118,8 +1147,13 @@ def init_bold_surf_wf(output_spaces, medial_surface_nan, name='bold_surf_wf'):
     workflow.connect([
         (inputnode, targets, [('subject_id', 'subject_id')]),
         (inputnode, rename_src, [('source_file', 'in_file')]),
+        (inputnode, resampling_xfm, [('source_file', 'source_file'),
+                                     ('t1_preproc', 'target_file')]),
+        (inputnode, set_xfm_source, [('t1_2_fsnative_forward_transform', 'in_lta2')]),
+        (resampling_xfm, set_xfm_source, [('out_lta', 'in_lta1')]),
         (inputnode, sampler, [('subjects_dir', 'subjects_dir'),
                               ('subject_id', 'subject_id')]),
+        (set_xfm_source, sampler, [('out_file', 'reg_file')]),
         (targets, sampler, [('out', 'target_subject')]),
         (rename_src, sampler, [('out_file', 'source_file')]),
         (merger, update_metadata, [('out', 'in_file')]),
@@ -1157,7 +1191,7 @@ def init_bold_mni_trans_wf(template, bold_file_size_gb, omp_nthreads,
                                     omp_nthreads=1,
                                     output_grid_ref=None)
 
-    Parameters
+    **Parameters**
 
         template : str
             Name of template targeted by `'template'` output space
@@ -1174,7 +1208,7 @@ def init_bold_mni_trans_wf(template, bold_file_size_gb, omp_nthreads,
         use_fieldwarp : bool
             Include SDC warp in single-shot transform from BOLD to MNI
 
-    Inputs
+    **Inputs**
 
         itk_bold_to_t1
             Affine transform from ``ref_bold_brain`` to T1 space (ITK format)
@@ -1192,7 +1226,7 @@ def init_bold_mni_trans_wf(template, bold_file_size_gb, omp_nthreads,
         fieldwarp
             a :abbr:`DFM (displacements field map)` in ITK format
 
-    Outputs
+    **Outputs**
 
         bold_mni
             BOLD series, resampled to template space
@@ -1229,8 +1263,7 @@ def init_bold_mni_trans_wf(template, bold_file_size_gb, omp_nthreads,
     gen_ref.inputs.fixed_image = op.join(nid.get_dataset(template_str), '1mm_T1.nii.gz')
 
     mask_mni_tfm = pe.Node(
-        ants.ApplyTransforms(interpolation='NearestNeighbor',
-                             float=True),
+        ApplyTransforms(interpolation='NearestNeighbor', float=True),
         name='mask_mni_tfm',
         mem_gb=0.1
     )
@@ -1257,7 +1290,7 @@ def init_bold_mni_trans_wf(template, bold_file_size_gb, omp_nthreads,
     ])
 
     bold_to_mni_transform = pe.Node(MultiApplyTransforms(
-        interpolation="LanczosWindowedSinc", float=True, nprocs=omp_nthreads),
+        interpolation="LanczosWindowedSinc", float=True, num_threads=omp_nthreads),
         name='bold_to_mni_transform', mem_gb=0.1, n_procs=omp_nthreads)
     # bold_to_mni_transform.terminal_output = 'file'
     merge = pe.Node(Merge(compress=use_compression), name='merge',
@@ -1284,8 +1317,8 @@ def init_bold_mni_trans_wf(template, bold_file_size_gb, omp_nthreads,
     return workflow
 
 
-def init_nonlinear_sdc_wf(bold_file, layout, freesurfer, bold2t1w_dof,
-                          template, omp_nthreads,
+def init_nonlinear_sdc_wf(bold_file, freesurfer, bold2t1w_dof,
+                          template, omp_nthreads, bold_pe='j',
                           atlas_threshold=3, name='nonlinear_sdc_wf'):
     """
     This workflow takes a skull-stripped T1w image and reference BOLD image and
@@ -1293,11 +1326,8 @@ def init_nonlinear_sdc_wf(bold_file, layout, freesurfer, bold2t1w_dof,
     normalization (SyN) and the average fieldmap atlas described in
     [Treiber2016]_.
 
-    If the phase-encoding (PE) direction is known, the SyN deformation is
-    restricted to that direction; otherwise, deformation fields are calculated
-    for both the right-left and anterior-posterior directions, and selected
-    based on the unwarped file that can be aligned to the T1w image with the
-    lowest boundary-based registration (BBR) cost.
+    SyN deformation is restricted to the phase-encoding (PE) direction.
+    If no PE direction is specified, anterior-posterior PE is assumed.
 
     SyN deformation is also restricted to regions that are expected to have a
     >3mm (approximately 1 voxel) warp, based on the fieldmap atlas.
@@ -1312,13 +1342,13 @@ def init_nonlinear_sdc_wf(bold_file, layout, freesurfer, bold2t1w_dof,
         from fmriprep.workflows.bold import init_nonlinear_sdc_wf
         wf = init_nonlinear_sdc_wf(
             bold_file='/dataset/sub-01/func/sub-01_task-rest_bold.nii.gz',
-            layout=None,
+            bold_pe='j',
             freesurfer=True,
             bold2t1w_dof=9,
             template='MNI152NLin2009cAsym',
             omp_nthreads=8)
 
-    Inputs
+    **Inputs**
 
         t1_brain
             skull-stripped, bias-corrected structural image
@@ -1328,12 +1358,8 @@ def init_nonlinear_sdc_wf(bold_file, layout, freesurfer, bold2t1w_dof,
             FAST segmentation white and gray matter, in native T1w space
         t1_2_mni_reverse_transform
             inverse registration transform of T1w image to MNI template
-        subjects_dir
-            FreeSurfer subjects directory (if applicable)
-        subject_id
-            FreeSurfer subject_id (if applicable)
 
-    Outputs
+    **Outputs**
 
         out_reference_brain
             the ``bold_ref`` image after unwarping
@@ -1362,12 +1388,16 @@ def init_nonlinear_sdc_wf(bold_file, layout, freesurfer, bold2t1w_dof,
     workflow = pe.Workflow(name=name)
     inputnode = pe.Node(
         niu.IdentityInterface(['t1_brain', 'bold_ref', 't1_2_mni_reverse_transform',
-                               'subjects_dir', 'subject_id', 't1_seg']),  # BBR requirements
+                               't1_seg']),
         name='inputnode')
     outputnode = pe.Node(
         niu.IdentityInterface(['out_reference_brain', 'out_mask', 'out_warp',
                                'out_warp_report', 'out_mask_report']),
         name='outputnode')
+
+    if bold_pe is None or bold_pe[0] not in ['i', 'j']:
+        LOGGER.warning('Incorrect phase-encoding direction, assuming PA (posterior-to-anterior')
+        bold_pe = 'j'
 
     # Collect predefined data
     # Atlas image and registration affine
@@ -1381,10 +1411,9 @@ def init_nonlinear_sdc_wf(bold_file, layout, freesurfer, bold2t1w_dof,
     invert_t1w = pe.Node(InvertT1w(), name='invert_t1w',
                          mem_gb=0.3)
 
-    ref_2_t1 = pe.Node(ants.Registration(from_file=affine_transform, num_threads=omp_nthreads),
+    ref_2_t1 = pe.Node(Registration(from_file=affine_transform, num_threads=omp_nthreads),
                        name='ref_2_t1', n_procs=omp_nthreads)
-    t1_2_ref = pe.Node(ants.ApplyTransforms(invert_transform_flags=[True],
-                                            num_threads=omp_nthreads),
+    t1_2_ref = pe.Node(ApplyTransforms(invert_transform_flags=[True], num_threads=omp_nthreads),
                        name='t1_2_ref', n_procs=omp_nthreads)
 
     # 1) BOLD -> T1; 2) MNI -> T1; 3) ATLAS -> MNI
@@ -1396,8 +1425,8 @@ def init_nonlinear_sdc_wf(bold_file, layout, freesurfer, bold2t1w_dof,
     #
     # ATLAS -> MNI -> T1 -> BOLD
     atlas_2_ref = pe.Node(
-        ants.ApplyTransforms(invert_transform_flags=[True, False, False],
-                             num_threads=omp_nthreads),
+        ApplyTransforms(invert_transform_flags=[True, False, False],
+                        num_threads=omp_nthreads),
         name='atlas_2_ref', n_procs=omp_nthreads,
         mem_gb=0.3)
     atlas_2_ref.inputs.input_image = atlas_img
@@ -1411,26 +1440,15 @@ def init_nonlinear_sdc_wf(bold_file, layout, freesurfer, bold2t1w_dof,
                                 mem_gb=DEFAULT_MEMORY_MIN_GB)
     fixed_image_masks.inputs.in1 = 'NULL'
 
-    if layout is None:
-        bold_pe = None
-    else:
-        bold_pe = layout.get_metadata(bold_file).get("PhaseEncodingDirection")
-
-    restrict_i = [[1, 0, 0], [1, 0, 0]]
-    restrict_j = [[0, 1, 0], [0, 1, 0]]
-
-    syn_i = pe.Node(
-        ants.Registration(from_file=syn_transform, num_threads=omp_nthreads,
-                          restrict_deformation=restrict_i),
-        name='syn_i', n_procs=omp_nthreads)
-    syn_j = pe.Node(
-        ants.Registration(from_file=syn_transform, num_threads=omp_nthreads,
-                          restrict_deformation=restrict_j),
-        name='syn_j', n_procs=omp_nthreads)
+    restrict = [[int(bold_pe[0] == 'i'), int(bold_pe[0] == 'j'), 0]] * 2
+    syn = pe.Node(
+        Registration(from_file=syn_transform, num_threads=omp_nthreads,
+                     restrict_deformation=restrict),
+        name='syn', n_procs=omp_nthreads)
 
     seg_2_ref = pe.Node(
-        ants.ApplyTransforms(interpolation='NearestNeighbor', float=True,
-                             invert_transform_flags=[True], num_threads=omp_nthreads),
+        ApplyTransforms(interpolation='NearestNeighbor', float=True,
+                        invert_transform_flags=[True], num_threads=omp_nthreads),
         name='seg_2_ref', n_procs=omp_nthreads, mem_gb=0.3)
     sel_wm = pe.Node(niu.Function(function=extract_wm), name='sel_wm',
                      mem_gb=DEFAULT_MEMORY_MIN_GB)
@@ -1453,79 +1471,23 @@ def init_nonlinear_sdc_wf(bold_file, layout, freesurfer, bold2t1w_dof,
         (transform_list, atlas_2_ref, [('out', 'transforms')]),
         (atlas_2_ref, threshold_atlas, [('output_image', 'in_file')]),
         (threshold_atlas, fixed_image_masks, [('out_file', 'in2')]),
-    ])
-
-    if bold_pe is None:
-        if freesurfer:
-            bbr_i_wf = init_bbreg_wf(bold2t1w_dof, report=False, reregister=False, name='bbr_i_wf')
-            bbr_j_wf = init_bbreg_wf(bold2t1w_dof, report=False, reregister=False, name='bbr_j_wf')
-        else:
-            bbr_i_wf = init_fsl_bbr_wf(bold2t1w_dof, report=False, name='bbr_i_wf')
-            bbr_j_wf = init_fsl_bbr_wf(bold2t1w_dof, report=False, name='bbr_j_wf')
-
-        def select_outputs(cost_i, warped_image_i, forward_transforms_i,
-                           cost_j, warped_image_j, forward_transforms_j):
-            if cost_i < cost_j:
-                return warped_image_i, forward_transforms_i
-            else:
-                return warped_image_j, forward_transforms_j
-
-        pe_chooser = pe.Node(
-            niu.Function(function=select_outputs,
-                         output_names=['warped_image', 'forward_transforms']),
-            name='pe_chooser', mem_gb=DEFAULT_MEMORY_MIN_GB)
-
-        workflow.connect([(inputnode, syn_i, [('bold_ref', 'moving_image')]),
-                          (t1_2_ref, syn_i, [('output_image', 'fixed_image')]),
-                          (fixed_image_masks, syn_i, [('out', 'fixed_image_masks')]),
-                          (inputnode, syn_j, [('bold_ref', 'moving_image')]),
-                          (t1_2_ref, syn_j, [('output_image', 'fixed_image')]),
-                          (fixed_image_masks, syn_j, [('out', 'fixed_image_masks')]),
-                          (inputnode, bbr_i_wf, [('subjects_dir', 'inputnode.subjects_dir'),
-                                                 ('subject_id', 'inputnode.subject_id'),
-                                                 ('t1_seg', 'inputnode.t1_seg'),
-                                                 ('t1_brain', 'inputnode.t1_brain')]),
-                          (inputnode, bbr_j_wf, [('subjects_dir', 'inputnode.subjects_dir'),
-                                                 ('subject_id', 'inputnode.subject_id'),
-                                                 ('t1_seg', 'inputnode.t1_seg'),
-                                                 ('t1_brain', 'inputnode.t1_brain')]),
-                          (syn_i, bbr_i_wf, [('warped_image', 'inputnode.in_file')]),
-                          (syn_j, bbr_j_wf, [('warped_image', 'inputnode.in_file')]),
-                          (bbr_i_wf, pe_chooser, [('outputnode.final_cost', 'cost_i')]),
-                          (bbr_j_wf, pe_chooser, [('outputnode.final_cost', 'cost_j')]),
-                          (syn_i, pe_chooser, [('warped_image', 'warped_image_i'),
-                                               ('forward_transforms', 'forward_transforms_i')]),
-                          (syn_j, pe_chooser, [('warped_image', 'warped_image_j'),
-                                               ('forward_transforms', 'forward_transforms_j')]),
-                          ])
-        syn_out = pe_chooser
-    elif bold_pe[0] == 'i':
-        workflow.connect([(inputnode, syn_i, [('bold_ref', 'moving_image')]),
-                          (t1_2_ref, syn_i, [('output_image', 'fixed_image')]),
-                          (fixed_image_masks, syn_i, [('out', 'fixed_image_masks')]),
-                          ])
-        syn_out = syn_i
-    elif bold_pe[0] == 'j':
-        workflow.connect([(inputnode, syn_j, [('bold_ref', 'moving_image')]),
-                          (t1_2_ref, syn_j, [('output_image', 'fixed_image')]),
-                          (fixed_image_masks, syn_j, [('out', 'fixed_image_masks')]),
-                          ])
-        syn_out = syn_j
-
-    workflow.connect([(inputnode, seg_2_ref, [('t1_seg', 'input_image')]),
-                      (ref_2_t1, seg_2_ref, [('forward_transforms', 'transforms')]),
-                      (syn_out, seg_2_ref, [('warped_image', 'reference_image')]),
-                      (seg_2_ref, sel_wm, [('output_image', 'in_seg')]),
-                      (inputnode, syn_rpt, [('bold_ref', 'before')]),
-                      (syn_out, syn_rpt, [('warped_image', 'after')]),
-                      (sel_wm, syn_rpt, [('out', 'wm_seg')]),
-                      (syn_out, skullstrip_bold_wf, [('warped_image', 'inputnode.in_file')]),
-                      (syn_out, outputnode, [('forward_transforms', 'out_warp')]),
-                      (skullstrip_bold_wf, outputnode, [
-                          ('outputnode.skull_stripped_file', 'out_reference_brain'),
-                          ('outputnode.mask_file', 'out_mask'),
-                          ('outputnode.out_report', 'out_mask_report')]),
-                      (syn_rpt, outputnode, [('out_report', 'out_warp_report')])])
+        (inputnode, syn, [('bold_ref', 'moving_image')]),
+        (t1_2_ref, syn, [('output_image', 'fixed_image')]),
+        (fixed_image_masks, syn, [('out', 'fixed_image_masks')]),
+        (inputnode, seg_2_ref, [('t1_seg', 'input_image')]),
+        (ref_2_t1, seg_2_ref, [('forward_transforms', 'transforms')]),
+        (syn, seg_2_ref, [('warped_image', 'reference_image')]),
+        (seg_2_ref, sel_wm, [('output_image', 'in_seg')]),
+        (inputnode, syn_rpt, [('bold_ref', 'before')]),
+        (syn, syn_rpt, [('warped_image', 'after')]),
+        (sel_wm, syn_rpt, [('out', 'wm_seg')]),
+        (syn, skullstrip_bold_wf, [('warped_image', 'inputnode.in_file')]),
+        (syn, outputnode, [('forward_transforms', 'out_warp')]),
+        (skullstrip_bold_wf, outputnode, [
+            ('outputnode.skull_stripped_file', 'out_reference_brain'),
+            ('outputnode.mask_file', 'out_mask'),
+            ('outputnode.out_report', 'out_mask_report')]),
+        (syn_rpt, outputnode, [('out_report', 'out_warp_report')])])
 
     return workflow
 
@@ -1542,14 +1504,14 @@ def init_fmap_unwarp_report_wf(reportlets_dir, name='fmap_unwarp_report_wf'):
         from fmriprep.workflows.anatomical import init_fmap_unwarp_report_wf
         wf = init_fmap_unwarp_report_wf(reportlets_dir='.')
 
-    Parameters
+    **Parameters**
 
         reportlets_dir : str
             Directory in which to save reportlets
         name : str, optional
             Workflow name (default: fmap_unwarp_report_wf)
 
-    Inputs
+    **Inputs**
 
         in_pre
             Reference image, before unwarping
@@ -1568,7 +1530,7 @@ def init_fmap_unwarp_report_wf(reportlets_dir, name='fmap_unwarp_report_wf'):
         fields=['in_pre', 'in_post', 'in_seg', 'in_xfm',
                 'name_source']), name='inputnode')
 
-    map_seg = pe.Node(ants.ApplyTransforms(
+    map_seg = pe.Node(ApplyTransforms(
         dimension=3, float=True, interpolation='NearestNeighbor'),
         name='map_seg', mem_gb=0.3)
 
@@ -1607,8 +1569,8 @@ def init_func_reports_wf(reportlets_dir, freesurfer, use_aroma, use_syn, name='f
     inputnode = pe.Node(
         niu.IdentityInterface(
             fields=['source_file', 'summary_report', 'validation_report', 'bold_mask_report',
-                    'bold_reg_report', 'acompcor_report', 'tcompcor_report', 'syn_sdc_report',
-                    'ica_aroma_report']),
+                    'bold_reg_report', 'bold_reg_fallback', 'acompcor_report', 'tcompcor_report',
+                    'syn_sdc_report', 'ica_aroma_report']),
         name='inputnode')
 
     ds_summary_report = pe.Node(
@@ -1635,9 +1597,14 @@ def init_func_reports_wf(reportlets_dir, freesurfer, use_aroma, use_syn, name='f
         name='ds_syn_sdc_report', run_without_submitting=True,
         mem_gb=DEFAULT_MEMORY_MIN_GB)
 
+    def _bold_reg_suffix(fallback, freesurfer):
+        if fallback:
+            return 'coreg' if freesurfer else 'flirt'
+        else:
+            return 'bbr' if freesurfer else 'flt_bbr'
+
     ds_bold_reg_report = pe.Node(
-        DerivativesDataSink(base_directory=reportlets_dir,
-                            suffix='bbr' if freesurfer else 'flt_bbr'),
+        DerivativesDataSink(base_directory=reportlets_dir),
         name='ds_bold_reg_report', run_without_submitting=True,
         mem_gb=DEFAULT_MEMORY_MIN_GB)
 
@@ -1666,8 +1633,10 @@ def init_func_reports_wf(reportlets_dir, freesurfer, use_aroma, use_syn, name='f
                                            ('validation_report', 'in_file')]),
         (inputnode, ds_bold_mask_report, [('source_file', 'source_file'),
                                           ('bold_mask_report', 'in_file')]),
-        (inputnode, ds_bold_reg_report, [('source_file', 'source_file'),
-                                         ('bold_reg_report', 'in_file')]),
+        (inputnode, ds_bold_reg_report, [
+            ('source_file', 'source_file'),
+            ('bold_reg_report', 'in_file'),
+            (('bold_reg_fallback', _bold_reg_suffix, freesurfer), 'suffix')]),
         (inputnode, ds_acompcor_report, [('source_file', 'source_file'),
                                          ('acompcor_report', 'in_file')]),
         (inputnode, ds_tcompcor_report, [('source_file', 'source_file'),
@@ -1798,15 +1767,11 @@ def init_func_derivatives_wf(output_dir, output_spaces, template, freesurfer,
 
 def _get_series_len(bold_fname):
     import nibabel as nb
-    from niworkflows.nipype.algorithms.confounds import is_outlier
+    from niworkflows.interfaces.registration import _get_vols_to_discard
     img = nb.load(bold_fname)
     if len(img.shape) < 4:
         return 1
 
-    # Replicate work done in EstimateReferenceImage to have access to
-    # skip_vols at workflow creation time
-    data_slice = img.dataobj[:, :, :, :50]
-    global_signal = data_slice.mean(axis=0).mean(axis=0).mean(axis=0)
-    skip_vols = is_outlier(global_signal)
+    skip_vols = _get_vols_to_discard(img)
 
     return img.shape[3] - skip_vols
